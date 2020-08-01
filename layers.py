@@ -36,7 +36,7 @@ class Upsample(layers.Layer):
         super().__init__()
 
     def call(self, x):
-        return tf.image.resize(input_layer, (input_layer.shape[1] * 2, input_layer.shape[2] * 2), method='bilinear')
+        return tf.image.resize(x, (x.shape[1] * 2, x.shape[2] * 2), method='bilinear')
 
 class YOLOConv(layers.Layer):
     def __init__(self, filters_shape, downsample=False, batchNormalization=True, activation="leaky"):
@@ -58,7 +58,7 @@ class YOLOConv(layers.Layer):
 
         self.layer_stack.append(
             layers.Conv2D(filters=filters_shape[-1], kernel_size = filters_shape[0], strides=strides, padding=padding,
-                          use_bias=not bn, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
+                          use_bias=not batchNormalization, kernel_regularizer=tf.keras.regularizers.l2(0.0005),
                           kernel_initializer=tf.random_normal_initializer(stddev=0.01),
                           bias_initializer=tf.constant_initializer(0.))
             )
