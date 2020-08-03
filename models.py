@@ -82,6 +82,8 @@ class YOLOv4(models.Model):
         ]
 
     def call(self, x):
+        assert x.shape[1] == x.shape[2]
+        
         route_1, route_2, x = self.darknet(x)
 
         route = x 
@@ -131,7 +133,7 @@ class YOLOv4(models.Model):
         for layer in self.mbbox_layer_stack:
             x = layer(x)
 
-        s_mbbox = x
+        x_mbbox = x
         x = route_2
 
         for layer in self.mbbox_layer_stack_skip:
