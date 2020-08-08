@@ -1,97 +1,313 @@
-import tensorflow as tf
 import numpy as np
+import yaml
+import cv2
+import tensorflow as tf
+import os
 from . import config
+from . import utils
 
-class YOLODataset(tf.data.TFRecordDataset):
-    MAX_BBOX_PER_SCALE=128
-    def __init__(self, filenames, num_classes, image_size=416, augment=False, compression_type=None, buffer_size=None, num_parallel_reads=None):
-        super().__init__(filenames, compression_type, buffer_size, num_parallel_reads)
-        self.num_classes = num_classes
-        self.image_size = image_size
-        self.augment = augment
+class Dataset(object):
+    MAX_BBOX_PER_SCALE = 128
 
-    def _parse(self, feature_dict={
-                            "image/height": tf.io.FixedLenFeature([], tf.int64),
-                            "image/width": tf.io.FixedLenFeature([], tf.int64),
-                            "image/filename": tf.io.FixedLenFeature([], tf.string),
-                            "image/source_id": tf.io.FixedLenFeature([], tf.string),
-                            "image/encoded": tf.io.FixedLenFeature([], tf.string),
-                            "image/format": tf.io.FixedLenFeature([], tf.string),
-                            "image/object/bbox/xmin": tf.io.RaggedFeature(tf.float32),
-                            "image/object/bbox/xmax": tf.io.RaggedFeature(tf.float32),
-                            "image/object/bbox/ymin": tf.io.RaggedFeature(tf.float32),
-                            "image/object/bbox/ymax": tf.io.RaggedFeature(tf.float32),
-                            "image/object/class/text": tf.io.FixedLenFeature([], tf.string),
-                            "image/object/class/label": tf.io.FixedLenFeature([], tf.string),
-                            }):
-        return self.map(
-            lambda example: tf.io.parse_single_example(example, feature_dict))
+    def __init__(self, path, train_or_test, image_size=416, batch_size = 2, augment = False):
+        """Created a dataset to be used to train or test a YOLO model
 
-    def preprocess(self, num_parallel_calls=4):
-        self._parse()
-        return self.map(
-            lambda example: self._preprocess(example),
-            num_parallel_calls=num_parallel_calls)
+        Args:
+            path (string): The path of the dataset file.
+            train_or_test (string): One of train or test
+            image_size (int, optional): The size that images will be resized to. Defaults to 416.
+            batch_size (int, optional): The number of examples per batch. Defaults to 2.
+            augment (bool, optional): Apply random augmentations to the images each batch.
 
-    def _augment(self, image, bboxes):
-        return image, bboxes
+        Raises:
+            FileNotFoundError: Raised when dataset file cannot be found. 
+        """
+        try:
+            with open(path, "r") as f:
+                dataset_dict = yaml.load(f, Loader=yaml.FullLoader)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Dataset file not found at {path}")
 
-
-    def _preprocess(self, example):
+        os.chdir(os.path.dirname(os.path.realpath(path)))
         
-        image = tf.io.decode_jpeg(example["image/encoded"], channels=3)
-        image = tf.image.resize(image, (self.image_size, self.image_size))
-        image = tf.cast(image, tf.float32)/255
+        self.train_or_test = train_or_test.lower()
+        assert train_or_test in ("train", "test")
 
+        self.augment_images = augment
+
+        self.batch_size = batch_size
         
-        anchor_per_scale = config["yolo"]["anchor_per_scale"]
-        height = example["image/height"]
-        width = example["image/width"]
-        bboxes = (np.array([
-            example['image/object/bbox/xmin'],
-            example['image/object/bbox/ymin'],
-            example['image/object/bbox/xmax'],
-            example['image/object/bbox/ymax'],
-            1
-            ]) * np.array([width, height, width, height, 1])).astype(np.int64)
+        self.num_classes = int(dataset_dict["classes"]["num_classes"])
 
-        bboxes[4] = (bboxes[2] - bboxes[0]) * (bboxes[3] - bboxes[1])
+        self.class_dict = dataset_dict["classes"]["class_names"]
 
-        if augment:
-            # Multiply dataset length by some amount.
-            self._augment(np.copy(image), np.copy(bboxes))
+        self.examples = dataset_dict["examples"][train_or_test]
+        self.num_examples = len(self.examples)
+        self.num_batches = int(np.ceil(self.num_examples / self.batch_size))
+        self.batch_count = 0
 
-        (
-            label_sbbox,
-            label_mbbox,
-            label_lbbox,
-            sbboxes,
-            mbboxes,
-            lbboxes,
-        ) = self._preprocess_true_boxes(bboxes)
+        self.train_input_size = image_size
+        self.strides = np.array(config["yolo"]["strides"])
+        self.train_output_sizes = self.train_input_size // self.strides
 
-        smaller_target = label_sbbox, sbboxes
-        medium_target = label_mbbox, mbboxes
-        large_target = label_lbbox, label_lbbox
-        return image, (
-            smaller_target, 
-            medium_target, 
-            large_target
+        self.anchor_per_scale = config["yolo"]["anchor_per_scale"]
+        self.anchors = np.array(config["yolo"]["anchors"])
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Return the next batch of the datset until it runs out of data
+        """
+        with tf.device("/cpu:0"):
+            batch_image = np.zeros(
+                (
+                    self.batch_size,
+                    self.train_input_size,
+                    self.train_input_size,
+                    3,
+                ),
+                dtype=np.float32,
+            )
+
+            batch_label_sbbox = np.zeros(
+                (
+                    self.batch_size,
+                    self.train_output_sizes[0],
+                    self.train_output_sizes[0],
+                    self.anchor_per_scale,
+                    5 + self.num_classes,
+                ),
+                dtype=np.float32,
+            )
+            batch_label_mbbox = np.zeros(
+                (
+                    self.batch_size,
+                    self.train_output_sizes[1],
+                    self.train_output_sizes[1],
+                    self.anchor_per_scale,
+                    5 + self.num_classes,
+                ),
+                dtype=np.float32,
+            )
+            batch_label_lbbox = np.zeros(
+                (
+                    self.batch_size,
+                    self.train_output_sizes[2],
+                    self.train_output_sizes[2],
+                    self.anchor_per_scale,
+                    5 + self.num_classes,
+                ),
+                dtype=np.float32,
+            )
+
+            batch_sbboxes = np.zeros(
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
+            )
+            batch_mbboxes = np.zeros(
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
+            )
+            batch_lbboxes = np.zeros(
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
             )
 
 
+            num = 0
+            if self.batch_count < self.num_batches:
+                while num < self.batch_size:
+                    index = self.batch_count * self.batch_size + num
+                    if index >= self.num_examples:
+                        index -= self.num_examples
+                    image, bboxes = self.parse_example(self.examples[index])
+                    (
+                        label_sbbox,
+                        label_mbbox,
+                        label_lbbox,
+                        sbboxes,
+                        mbboxes,
+                        lbboxes,
+                    ) = self.preprocess_true_boxes(bboxes)
 
-    def _preprocess_true_boxes(self, bboxes):
-        anchor_per_scale = config["yolo"]["anchor_per_scale"]
-        strides = config["yolo"]["strides"]
-        anchors = config["yolo"]["anchors"]
+                    batch_image[num, :, :, :] = image
+                    batch_label_sbbox[num, :, :, :, :] = label_sbbox
+                    batch_label_mbbox[num, :, :, :, :] = label_mbbox
+                    batch_label_lbbox[num, :, :, :, :] = label_lbbox
+                    batch_sbboxes[num, :, :] = sbboxes
+                    batch_mbboxes[num, :, :] = mbboxes
+                    batch_lbboxes[num, :, :] = lbboxes
+                    num += 1
+                self.batch_count += 1
+                batch_smaller_target = batch_label_sbbox, batch_sbboxes
+                batch_medium_target = batch_label_mbbox, batch_mbboxes
+                batch_larger_target = batch_label_lbbox, batch_lbboxes
 
+                return (
+                    batch_image,
+                    (
+                        batch_smaller_target,
+                        batch_medium_target,
+                        batch_larger_target,
+                    ),
+                )
+            else:
+                self.batch_count = 0
+                np.random.shuffle(self.examples)
+                raise StopIteration
+
+    def __len__(self):
+        return self.num_batches
+
+    def parse_example(self, example):
+        image = cv2.imread(example["image/filename"])
+        if type(image) == type(None):
+            print(image)
+            raise FileNotFoundError(f"Image {example['image/filename']} not found")
+
+        height, width = example["image/height"], example["image/width"]
+
+        labels = example["image/object/class/label"]
+
+        bboxes = np.zeros((len(labels),5), dtype=np.int64)
+
+        bboxes[:, 0] = [int(x*width) for x in example["image/object/bbox/xmin"]]
+        bboxes[:, 1] = [int(y*height) for y in example["image/object/bbox/ymin"]]
+        bboxes[:, 2] = [int(x*width) for x in example["image/object/bbox/xmax"]]
+        bboxes[:, 3] = [int(y*height) for y in example["image/object/bbox/ymax"]]
+        bboxes[:, 4] = [int(x) for x in labels]
+
+        if self.augment_images:
+            image, bboxes = self.random_horizontal_flip(
+                np.copy(image), np.copy(bboxes)
+            )
+            image, bboxes = self.random_crop(np.copy(image), np.copy(bboxes))
+            image, bboxes = self.random_translate(
+                np.copy(image), np.copy(bboxes)
+            )
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image, bboxes = utils.image_preprocess(
+            np.copy(image),
+            np.copy(bboxes),
+            self.train_input_size,
+        )
+        return image, bboxes
+
+    def random_horizontal_flip(self, image, bboxes):
+        """Randomly flips images and adjusts bboxes. 
+
+        Args:
+            image (np.ndarray): The image to be resized.
+            bboxes (np.ndarray): The bounding boxes related to the image. 
+
+        Returns:
+            np.ndarray: The adjusted image.
+            np.ndarray: The adjusted bboxes.
+        """
+        if np.random.rand() < 0.5:
+            _, width, _ = image.shape
+            image = image[:, ::-1, :]
+            bboxes[:, [0, 2]] = width - bboxes[:, [2, 0]]
+
+        return image, bboxes
+
+    def random_crop(self, image, bboxes):
+        """Randomly translated images without cropping out any bboxes and adjusts bboxes. 
+
+        Args:
+            image (np.ndarray): The image to be resized.
+            bboxes (np.ndarray): The bounding boxes related to the image. 
+
+        Returns:
+            np.ndarray: The adjusted image.
+            np.ndarray: The adjusted bboxes.
+        """
+        if np.random.rand() < 0.5:
+            height, width, _ = image.shape
+            max_bbox = np.concatenate(
+                [
+                    np.min(bboxes[:, 0:2], axis=0),
+                    np.max(bboxes[:, 2:4], axis=0),
+                ],
+                axis=-1,
+            )
+
+            max_left = max_bbox[0]
+            max_up = max_bbox[1]
+            max_right = width - max_bbox[2]
+            max_down = height - max_bbox[3]
+
+            crop_xmin = max(
+                0, int(max_bbox[0] - np.random.uniform(0, max_left))
+            )
+            crop_ymin = max(
+                0, int(max_bbox[1] - np.random.uniform(0, max_up))
+            )
+            crop_xmax = max(
+                width, int(max_bbox[2] + np.random.uniform(0, max_right))
+            )
+            crop_ymax = max(
+                height, int(max_bbox[3] + np.random.uniform(0, max_down))
+            )
+
+            image = image[crop_ymin:crop_ymax, crop_xmin:crop_xmax]
+
+            bboxes[:, [0, 2]] = bboxes[:, [0, 2]] - crop_xmin
+            bboxes[:, [1, 3]] = bboxes[:, [1, 3]] - crop_ymin
+
+        return image, bboxes
+        
+    def random_translate(self, image, bboxes):
+        """Randomly translated images without removing any bboxes and adjusts bboxes.
+
+        Args:
+            image (np.ndarray): The image to be resized.
+            bboxes (np.ndarray): The bounding boxes related to the image. 
+
+        Returns:
+            np.ndarray: The adjusted image.
+            np.ndarray: The adjusted bboxes.
+        """
+        if np.random.rand() < 0.5:
+            height, width, _ = image.shape
+            max_bbox = np.concatenate(
+                [
+                    np.min(bboxes[:, 0:2], axis=0),
+                    np.max(bboxes[:, 2:4], axis=0),
+                ],
+                axis=-1,
+            )
+
+            max_left = max_bbox[0]
+            max_up = max_bbox[1]
+            max_right = width - max_bbox[2]
+            max_down = height - max_bbox[3]
+
+            translation_x = random.uniform(-(max_left - 1), (max_right - 1))
+            translation_y = random.uniform(-(max_up - 1), (max_down - 1))
+
+            M = np.array([[1, 0, translation_x], [0, 1, translation_y]])
+            image = cv2.warpAffine(image, M, (width, height))
+
+            bboxes[:, [0, 2]] = bboxes[:, [0, 2]] + translation_x
+            bboxes[:, [1, 3]] = bboxes[:, [1, 3]] + translation_y
+
+        return image, bboxes
+
+    def preprocess_true_boxes(self, bboxes):
+        """Preprocesses bounding boxes from the dataset so that they can be used to train on. 
+
+        Args:
+            bboxes (np.nparray): Unprocessed bboxes. 
+
+        Returns:
+            np.ndarray * 6: label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes
+        """
         label = [
             np.zeros(
                 (
-                    self.image_size/strides[i],
-                    self.image_size/strides[i],
-                    anchor_per_scale,
+                    self.train_output_sizes[i],
+                    self.train_output_sizes[i],
+                    self.anchor_per_scale,
                     5 + self.num_classes,
                 )
             )
@@ -120,13 +336,13 @@ class YOLODataset(tf.data.TFRecordDataset):
                 axis=-1,
             )
             bbox_xywh_scaled = (
-                1.0 * bbox_xywh[np.newaxis, :] / strides[:, np.newaxis]
+                1.0 * bbox_xywh[np.newaxis, :] / self.strides[:, np.newaxis]
             )
 
             iou = []
             exist_positive = False
             for i in range(3):
-                anchors_xywh = np.zeros((anchor_per_scale, 4))
+                anchors_xywh = np.zeros((self.anchor_per_scale, 4))
                 anchors_xywh[:, 0:2] = (
                     np.floor(bbox_xywh_scaled[i, 0:2]).astype(np.int32) + 0.5
                 )
@@ -143,6 +359,8 @@ class YOLODataset(tf.data.TFRecordDataset):
                         np.int32
                     )
 
+                    print(xind, yind)
+
                     label[i][yind, xind, iou_mask, :] = 0
                     label[i][yind, xind, iou_mask, 0:4] = bbox_xywh
                     label[i][yind, xind, iou_mask, 4:5] = 1.0
@@ -156,8 +374,8 @@ class YOLODataset(tf.data.TFRecordDataset):
 
             if not exist_positive:
                 best_anchor_ind = np.argmax(np.array(iou).reshape(-1), axis=-1)
-                best_detect = int(best_anchor_ind / anchor_per_scale)
-                best_anchor = int(best_anchor_ind % anchor_per_scale)
+                best_detect = int(best_anchor_ind / self.anchor_per_scale)
+                best_anchor = int(best_anchor_ind % self.anchor_per_scale)
                 xind, yind = np.floor(
                     bbox_xywh_scaled[best_detect, 0:2]
                 ).astype(np.int32)
@@ -174,6 +392,4 @@ class YOLODataset(tf.data.TFRecordDataset):
                 bbox_count[best_detect] += 1
         label_sbbox, label_mbbox, label_lbbox = label
         sbboxes, mbboxes, lbboxes = bboxes_xywh
-
         return label_sbbox, label_mbbox, label_lbbox, sbboxes, mbboxes, lbboxes
-
