@@ -53,6 +53,9 @@ class Dataset(object):
         self.anchor_per_scale = config["yolo"]["anchor_per_scale"]
         self.anchors = np.array(config["yolo"]["anchors"])
 
+        np.random.seed(42)
+        np.random.shuffle(self.examples)
+
     def __iter__(self):
         return self
 
@@ -119,6 +122,7 @@ class Dataset(object):
                     if index >= self.num_examples:
                         index -= self.num_examples
                     image, bboxes = self.parse_example(self.examples[index])
+
                     (
                         label_sbbox,
                         label_mbbox,
@@ -127,7 +131,7 @@ class Dataset(object):
                         mbboxes,
                         lbboxes,
                     ) = self.preprocess_true_boxes(bboxes)
-
+                    
                     batch_image[num, :, :, :] = image
                     batch_label_sbbox[num, :, :, :, :] = label_sbbox
                     batch_label_mbbox[num, :, :, :, :] = label_mbbox
@@ -160,7 +164,6 @@ class Dataset(object):
     def parse_example(self, example):
         image = cv2.imread(example["image/filename"])
         if type(image) == type(None):
-            print(image)
             raise FileNotFoundError(f"Image {example['image/filename']} not found")
 
         height, width = example["image/height"], example["image/width"]
@@ -168,7 +171,7 @@ class Dataset(object):
         labels = example["image/object/class/label"]
 
         bboxes = np.zeros((len(labels),5), dtype=np.int64)
-
+    
         bboxes[:, 0] = [int(x*width) for x in example["image/object/bbox/xmin"]]
         bboxes[:, 1] = [int(y*height) for y in example["image/object/bbox/ymin"]]
         bboxes[:, 2] = [int(x*width) for x in example["image/object/bbox/xmax"]]
@@ -313,13 +316,13 @@ class Dataset(object):
             )
             for i in range(3)
         ]
+
         bboxes_xywh = [np.zeros((self.MAX_BBOX_PER_SCALE, 4)) for _ in range(3)]
         bbox_count = np.zeros((3,))
 
         for bbox in bboxes:
             bbox_coor = bbox[:4]
             bbox_class_ind = bbox[4]
-
             onehot = np.zeros(self.num_classes, dtype=np.float)
             onehot[bbox_class_ind] = 1.0
             uniform_distribution = np.full(
@@ -358,8 +361,6 @@ class Dataset(object):
                     xind, yind = np.floor(bbox_xywh_scaled[i, 0:2]).astype(
                         np.int32
                     )
-
-                    print(xind, yind)
 
                     label[i][yind, xind, iou_mask, :] = 0
                     label[i][yind, xind, iou_mask, 0:4] = bbox_xywh

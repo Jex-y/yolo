@@ -25,8 +25,8 @@ def image_preprocess(image, bboxes, train_input_size):
     image_paded[pad_width:new_width+pad_width, pad_height:new_height+pad_height, :] = image_resized
     image_paded = image_paded / 255.
 
-    bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * scale + pad_height
-    bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * scale + pad_width
+    bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * scale + pad_width
+    bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * scale + pad_height
     return image_paded, bboxes
 
 def bbox_iou(bboxes1, bboxes2):
