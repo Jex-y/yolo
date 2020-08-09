@@ -2,6 +2,8 @@ import tensorflow as tf
 from . import layers, config, utils
 import numpy as np
 from time import time_ns as ns
+import datetime
+
 
 class YOLOModel(tf.keras.Model):
     def __init__(self, num_classes, image_size=416, *args, **kwargs):
@@ -28,6 +30,17 @@ class YOLOModel(tf.keras.Model):
         total_steps = 0
         training_steps = steps_per_epoch * epochs
 
+        current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
+        train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+
+        tb_callback = tf.keras.callbacks.TensorBoard(train_log_dir) #TODO: Find a better way to do this.
+        tb_callback.set_model(self)
+
+        if val_dataset:
+            test_log_dir = 'logs/gradient_tape/' + current_time + '/test'
+            test_summary_writer = tf.summary.create_file_writer(test_log_dir)
+
         for epoch in range(epochs):
             tf.print(f"Epoch {epoch+1}/{epochs}")
             start = ns()
@@ -42,23 +55,58 @@ class YOLOModel(tf.keras.Model):
                 self.optimizer.lr.assign(lr.numpy())
                 
                 done = f"{i+1}/{steps_per_epoch}"
-                time_per_step = (i+1)/(ns()-start)
+                time_per_step = (ns()-start)/(i+1)
                 time_left = self._ns_to_string((steps_per_epoch - i+1) * time_per_step)
                 bar = self._progress_bar((i+1)/steps_per_epoch)
                 tf.print(
-                    f"\r%4d\%4d {bar} - {time_left} - total loss: %4.2f - giou loss: %4.2f - conf_loss: %4.2f - prob_loss %4.2f" 
-                    % (i+1, steps_per_epoch, total_loss, giou_loss, conf_loss, prob_loss),
+                    f"\r{done} {bar} {time_left} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f {' '*10}" 
+                    % ( total_loss, giou_loss, conf_loss, prob_loss),
                     end="")
 
-                total_steps += 1            
+                total_steps += 1   
+
+                # with train_summary_writer.as_default():
+                #     tf.summary.image("Training data", image, i)    
+
             time_taken = self._ns_to_string(ns()-start)
             tf.print(
-                f"\r{done} {bar} - {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf_loss: %4.2f - prob_loss %4.2f"
-                % (i+1, steps_per_epoch, total_loss, giou_loss, conf_loss, prob_loss))
+                f"\r{done} {bar} {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f {' '*10}"
+                % (total_loss, giou_loss, conf_loss, prob_loss))
+
+            with train_summary_writer.as_default():
+                tf.summary.scalar("lr", lr, epoch)
+                tf.summary.scalar("loss/total_loss", total_loss, epoch)
+                tf.summary.scalar("loss/giou_loss", giou_loss, epoch)
+                tf.summary.scalar("loss/conf_loss", conf_loss, epoch)
+                tf.summary.scalar("loss/prob_loss", prob_loss, epoch)
             
             if val_dataset:
+                start = ns()
+                step_per_val_epoch = len(val_dataset)
                 for i, (image, target) in enumerate(val_dataset):
-                    self.train_step(image, target)
+                    giou_loss, conf_loss, prob_loss = self.val_step(image, target)
+                    total_loss = giou_loss + conf_loss + prob_loss
+
+                    done = f"{i+1}/{step_per_val_epoch}"
+                    time_per_step = (ns()-start)/(i+1)
+                    time_left = self._ns_to_string((step_per_val_epoch - i+1) * time_per_step)
+                    bar = self._progress_bar((i+1)/step_per_val_epoch)
+                    tf.print(
+                    f"\r{done} {bar} - {time_left} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}" 
+                    % ( total_loss, giou_loss, conf_loss, prob_loss),
+                    end="")
+
+                time_taken = self._ns_to_string(ns()-start)
+                tf.print(
+                f"\r{done} {bar} - {time_taken} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}"
+                % (total_loss, giou_loss, conf_loss, prob_loss))
+
+                with test_summary_writer.as_default():
+                    tf.summary.scalar("loss/total_loss", total_loss, epoch)
+                    tf.summary.scalar("loss/giou_loss", giou_loss, epoch)
+                    tf.summary.scalar("loss/conf_loss", conf_loss, epoch)
+                    tf.summary.scalar("loss/prob_loss", prob_loss, epoch)
+            
 
 
     def freeze(self, freeze=True):
@@ -67,19 +115,21 @@ class YOLOModel(tf.keras.Model):
 
 
     def _ns_to_string(self, time):
-        small_units = ("ns", "µs", "ms", "s")
+        small_units = ("ns", "µs", "ms")
         time = float(time)
         for unit in small_units:
-            if time > 1000:
+            if time >= 1000:
                 time /= 1000
             else:
-                return f"{time:.0f} {unit}"
-
-        secs = time%60
-        mins = (time//60)
-        hours = (mins//60)
-        mins = mins % 60
-        return f"{hours}:{mins}:{secs}"
+                output = f"[{time:3.0f} {unit}]"
+                break
+        else:
+            secs = time%60
+            mins = (time//60)
+            hours = (mins//60)
+            mins = mins % 60
+            output = f"[{hours:2.0f}:{mins:2.0f}:{secs:2.0f}]"
+        return output
 
     def _progress_bar(
         self, progress, length=32, 
@@ -97,12 +147,14 @@ class YOLOModel(tf.keras.Model):
     def train_step(self, image, target):
         with tf.GradientTape() as tape:
             raw_result = self(image, training=True)
-            pred_result = [self._decode_train(raw_result[i], i) for i in range(3)]
+            pred_result = []
+            for i in range(3):
+                pred_result.append(raw_result[i])
+                pred_result.append(self._decode_train(raw_result[i], i))
             giou_loss = conf_loss = prob_loss = 0
 
             for scale in range(3): # Len freeze layers, maybe freeze layers are the output ones for each scale??
                 conv, pred = pred_result[scale * 2], pred_result[scale * 2 + 1]
-                print(conv.shape, pred.shape)
                 losses = self._compute_loss(pred, conv, target[scale][0], target[scale][1], scale)
                 giou_loss += losses[0]
                 conf_loss += losses[1]
@@ -118,7 +170,22 @@ class YOLOModel(tf.keras.Model):
 
     @tf.function
     def val_step(self, image, target):
-        pass
+        raw_result = self(image, training=True)
+        pred_result = []
+        for i in range(3):
+            pred_result.append(raw_result[i])
+            pred_result.append(self._decode_train(raw_result[i], i))
+        giou_loss = conf_loss = prob_loss = 0
+
+        for scale in range(3): # Len freeze layers, maybe freeze layers are the output ones for each scale??
+            conv, pred = pred_result[scale * 2], pred_result[scale * 2 + 1]
+            losses = self._compute_loss(pred, conv, target[scale][0], target[scale][1], scale)
+            giou_loss += losses[0]
+            conf_loss += losses[1]
+            prob_loss += losses[2]
+
+        return giou_loss, conf_loss, prob_loss
+        
 
     @tf.function
     def _compute_loss(self, pred, conv, label, bboxes, scale=0):
@@ -150,9 +217,6 @@ class YOLOModel(tf.keras.Model):
         label_xywh    = label[:, :, :, :, 0:4]
         respond_bbox  = label[:, :, :, :, 4:5]
         label_prob    = label[:, :, :, :, 5:]
-
-        print(pred_xywh.shape)
-        print(label_xywh.shape)
 
         giou = tf.expand_dims(utils.bbox_giou(pred_xywh, label_xywh), axis=-1)
         input_size = tf.cast(input_size, tf.float32)
