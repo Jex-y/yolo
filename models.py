@@ -3,6 +3,7 @@ from . import layers, config, utils
 import numpy as np
 from time import time_ns as ns
 import datetime
+import os
 
 
 class YOLOModel(tf.keras.Model):
@@ -24,22 +25,23 @@ class YOLOModel(tf.keras.Model):
             tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 
-    def fit(self, dataset, epochs=1,  val_dataset=None, start_lr = 1e-3, end_lr = 1e-6):
+    def fit(self, dataset, first_stage_epochs=1, second_stage_epochs=0, val_dataset=None, start_lr = 1e-3, end_lr = 1e-6, checkpoint_dir = "./checkpoints"):
         steps_per_epoch = len(dataset)
 
         total_steps = 0
+        epochs = first_stage_epochs + second_stage_epochs
         training_steps = steps_per_epoch * epochs
 
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
         train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 
-        tb_callback = tf.keras.callbacks.TensorBoard(train_log_dir) #TODO: Find a better way to do this.
-        tb_callback.set_model(self)
-
         if val_dataset:
             test_log_dir = 'logs/gradient_tape/' + current_time + '/test'
             test_summary_writer = tf.summary.create_file_writer(test_log_dir)
+
+        if checkpoint_dir:
+            checkpoint_dir = checkpoint_dir + "/" + current_time
 
         for epoch in range(epochs):
             tf.print(f"Epoch {epoch+1}/{epochs}")
@@ -54,24 +56,21 @@ class YOLOModel(tf.keras.Model):
 
                 self.optimizer.lr.assign(lr.numpy())
                 
-                done = f"{i+1}/{steps_per_epoch}"
+                done = f"[{i+1:04d}|{steps_per_epoch:04d}]"
                 time_per_step = (ns()-start)/(i+1)
                 time_left = self._ns_to_string((steps_per_epoch - i+1) * time_per_step)
                 bar = self._progress_bar((i+1)/steps_per_epoch)
                 tf.print(
-                    f"\r{done} {bar} {time_left} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f {' '*10}" 
-                    % ( total_loss, giou_loss, conf_loss, prob_loss),
+                    f"\r{done} {bar} {time_left} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f - lr %f {' '*10}" 
+                    % ( total_loss, giou_loss, conf_loss, prob_loss, lr),
                     end="")
 
                 total_steps += 1   
 
-                # with train_summary_writer.as_default():
-                #     tf.summary.image("Training data", image, i)    
-
             time_taken = self._ns_to_string(ns()-start)
             tf.print(
-                f"\r{done} {bar} {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f {' '*10}"
-                % (total_loss, giou_loss, conf_loss, prob_loss))
+                f"\r{done} {bar} {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f - lr %f{' '*10}"
+                % (total_loss, giou_loss, conf_loss, prob_loss, lr))
 
             with train_summary_writer.as_default():
                 tf.summary.scalar("lr", lr, epoch)
@@ -87,18 +86,18 @@ class YOLOModel(tf.keras.Model):
                     giou_loss, conf_loss, prob_loss = self.val_step(image, target)
                     total_loss = giou_loss + conf_loss + prob_loss
 
-                    done = f"{i+1}/{step_per_val_epoch}"
+                    done = f"[{i+1:04d}|{step_per_val_epoch:04d}]"
                     time_per_step = (ns()-start)/(i+1)
                     time_left = self._ns_to_string((step_per_val_epoch - i+1) * time_per_step)
                     bar = self._progress_bar((i+1)/step_per_val_epoch)
                     tf.print(
-                    f"\r{done} {bar} - {time_left} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}" 
+                    f"\r{done} {bar} {time_left} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}" 
                     % ( total_loss, giou_loss, conf_loss, prob_loss),
                     end="")
 
                 time_taken = self._ns_to_string(ns()-start)
                 tf.print(
-                f"\r{done} {bar} - {time_taken} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}"
+                f"\r{done} {bar} {time_taken} - val total loss: %4.2f - val giou loss: %4.2f - val conf loss: %4.2f - val prob loss %4.2f {' '*10}"
                 % (total_loss, giou_loss, conf_loss, prob_loss))
 
                 with test_summary_writer.as_default():
@@ -106,8 +105,17 @@ class YOLOModel(tf.keras.Model):
                     tf.summary.scalar("loss/giou_loss", giou_loss, epoch)
                     tf.summary.scalar("loss/conf_loss", conf_loss, epoch)
                     tf.summary.scalar("loss/prob_loss", prob_loss, epoch)
-            
 
+            
+            if checkpoint_dir:
+                file_name = f"epoch{epoch+1:04d}of{epochs:04d}.ckpt"
+                path = os.path.join(checkpoint_dir, file_name)
+                self.save_weights(path)
+                tf.print(f"Checkpoint saved to {file_name}")
+
+            if epoch+1== first_stage_epochs:
+                tf.print("Entering second training stage - Freezing output layers")
+                self.freeze(True)
 
     def freeze(self, freeze=True):
         for layer in self.freeze_layers:
@@ -128,7 +136,7 @@ class YOLOModel(tf.keras.Model):
             mins = (time//60)
             hours = (mins//60)
             mins = mins % 60
-            output = f"[{hours:2.0f}:{mins:2.0f}:{secs:2.0f}]"
+            output = f"[{hours:02.0f}:{mins:02.0f}:{secs:02.0f}]"
         return output
 
     def _progress_bar(
@@ -239,9 +247,9 @@ class YOLOModel(tf.keras.Model):
 
         prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob, logits=conv_raw_prob)
 
-        giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1,2,3,4]))
-        conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1,2,3,4]))
-        prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1,2,3,4]))
+        giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1,2,3,4])) * 10
+        conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1,2,3,4])) * 1
+        prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1,2,3,4])) * 1
 
         return giou_loss, conf_loss, prob_loss
 
@@ -356,8 +364,11 @@ class YOLOv4(YOLOModel):
             layers.YOLOConv( (1, 1, 1024, 3 * (self.num_classes + 5)), activation=None, batchNormalization=False )
         ]
 
-        #TODO: Figure out which layers need to be frozen.
-        self.freeze_layers = []
+        self.freeze_layers = [
+            self.lbbox_layer_stack[-1],
+            self.mbbox_layer_stack[-1],
+            self.lbbox_layer_stack[-1],
+        ]
 
     def call(self, x):
         assert x.shape[1] == x.shape[2]
