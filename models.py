@@ -7,11 +7,10 @@ import os
 
 
 class YOLOModel(tf.keras.Model):
-    def __init__(self, num_classes, image_size=416, *args, **kwargs):
+    def __init__(self, num_classes, *args, **kwargs):
         super(YOLOModel, self).__init__(*args, **kwargs)
 
         self.num_classes = num_classes
-        self.image_size = image_size
         self.frozen = False
         self.optimizer = tf.keras.optimizers.Adam()
 
@@ -25,11 +24,14 @@ class YOLOModel(tf.keras.Model):
             tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 
-    def fit(self, dataset, first_stage_epochs=1, second_stage_epochs=0, val_dataset=None, start_lr = 1e-3, end_lr = 1e-6, checkpoint_dir = "./checkpoints"):
+    def fit(self, dataset, epochs=1, first_stage_epochs=None, second_stage_epochs=None, val_dataset=None, start_lr = 1e-3, end_lr = 1e-6, checkpoint_dir = "./checkpoints"):
         steps_per_epoch = len(dataset)
 
         total_steps = 0
-        epochs = first_stage_epochs + second_stage_epochs
+        if first_stage_epochs and second_stage_epochs:
+            epochs = first_stage_epochs + second_stage_epochs
+            self.freeze(True)
+
         training_steps = steps_per_epoch * epochs
 
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -47,6 +49,7 @@ class YOLOModel(tf.keras.Model):
             tf.print(f"Epoch {epoch+1}/{epochs}")
             start = ns()
             for i, (image, target) in enumerate(dataset):
+                break
                 giou_loss, conf_loss, prob_loss = self.train_step(image, target)
                 total_loss = giou_loss + conf_loss + prob_loss
 
@@ -67,10 +70,12 @@ class YOLOModel(tf.keras.Model):
 
                 total_steps += 1   
 
-            time_taken = self._ns_to_string(ns()-start)
-            tf.print(
-                f"\r{done} {bar} {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f - lr %f{' '*10}"
-                % (total_loss, giou_loss, conf_loss, prob_loss, lr))
+            # time_taken = self._ns_to_string(ns()-start)
+            # tf.print(
+            #     f"\r{done} {bar} {time_taken} - total loss: %4.2f - giou loss: %4.2f - conf loss: %4.2f - prob loss %4.2f - lr %f{' '*10}"
+            #     % (total_loss, giou_loss, conf_loss, prob_loss, lr))
+
+            example_bboxes = self.draw_bboxes(image[0])
 
             with train_summary_writer.as_default():
                 tf.summary.scalar("lr", lr, epoch)
@@ -78,6 +83,7 @@ class YOLOModel(tf.keras.Model):
                 tf.summary.scalar("loss/giou_loss", giou_loss, epoch)
                 tf.summary.scalar("loss/conf_loss", conf_loss, epoch)
                 tf.summary.scalar("loss/prob_loss", prob_loss, epoch)
+                tf.summary.image("example_bboxes", example_bboxes, step=epoch)
             
             if val_dataset:
                 start = ns()
@@ -113,9 +119,14 @@ class YOLOModel(tf.keras.Model):
                 self.save_weights(path)
                 tf.print(f"Checkpoint saved to {file_name}")
 
-            if epoch+1== first_stage_epochs:
-                tf.print("Entering second training stage - Freezing output layers")
-                self.freeze(True)
+            if first_stage_epochs and second_stage_epochs:
+                if epoch+1== first_stage_epochs:
+                    tf.print("Entering second training stage - Unfreezing output layers")
+                    self.freeze(False)
+
+    def __call__(self, x, **kwargs):
+        assert x.shape[1] == x.shape[2]
+        return super(YOLOModel, self).__call__(x, **kwargs)
 
     def freeze(self, freeze=True):
         for layer in self.freeze_layers:
@@ -158,7 +169,7 @@ class YOLOModel(tf.keras.Model):
             pred_result = []
             for i in range(3):
                 pred_result.append(raw_result[i])
-                pred_result.append(self._decode_train(raw_result[i], i))
+                pred_result.append(self._decode_train(raw_result[i], i, image.shape[1]))
             giou_loss = conf_loss = prob_loss = 0
 
             for scale in range(3): # Len freeze layers, maybe freeze layers are the output ones for each scale??
@@ -254,8 +265,8 @@ class YOLOModel(tf.keras.Model):
         return giou_loss, conf_loss, prob_loss
 
     @tf.function
-    def _decode_train(self, conv_output, scale):
-        output_size = self.image_size // self.strides[scale]
+    def _decode_train(self, conv_output, scale, image_size):
+        output_size = image_size // self.strides[scale]
         conv_output = tf.reshape(conv_output,
                                 (tf.shape(conv_output)[0], output_size, output_size, 3, 5 + self.num_classes))
 
@@ -278,14 +289,141 @@ class YOLOModel(tf.keras.Model):
 
         return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
 
+    #@tf.function
+    def _decode(self, conv_output, scale, image_size):
+        output_size = image_size // self.strides
+        batch_size = tf.shape(conv_output)[0]
+        conv_output = tf.reshape(conv_output,
+                                (batch_size, output_size, output_size, 3, 5 + self.num_classes))
+
+        conv_raw_dxdy, conv_raw_dwdh, conv_raw_conf, conv_raw_prob = tf.split(conv_output, (2, 2, 1, self.num_classes),
+                                                                            axis=-1)
+
+        xy_grid = tf.meshgrid(tf.range(output_size), tf.range(output_size))
+        xy_grid = tf.expand_dims(tf.stack(xy_grid, axis=-1), axis=2)  # [gx, gy, 1, 2]
+        xy_grid = tf.tile(tf.expand_dims(xy_grid, axis=0), [batch_size, 1, 1, 3, 1])
+
+        xy_grid = tf.cast(xy_grid, tf.float32)
+
+        pred_xy = ((tf.sigmoid(conv_raw_dxdy) * self.xyscale[scale]) - 0.5 * (self.xyscale[scale] - 1) + xy_grid) * \
+                self.strides[scale]
+        pred_wh = (tf.exp(conv_raw_dwdh) * self.anchors[scale])
+        pred_xywh = tf.concat([pred_xy, pred_wh], axis=-1)
+
+        pred_conf = tf.sigmoid(conv_raw_conf)
+        pred_prob = tf.sigmoid(conv_raw_prob)
+
+        pred_prob = pred_conf * pred_prob
+        pred_prob = tf.reshape(pred_prob, (batch_size, -1, self.num_classes))
+        pred_xywh = tf.reshape(pred_xywh, (batch_size, -1, 4))
+        return pred_xywh, pred_prob
+
+    @tf.function
+    def _filter_bboxes(self, bboxes, scores, score_threshold, image_size):
+        scores_max = tf.math.reduce_max(scores, axis=-1)
+
+        mask = scores_max >= score_threshold
+        class_boxes = tf.boolean_mask(box_xywh, mask)
+        pred_conf = tf.boolean_mask(scores, mask)
+        class_boxes = tf.reshape(class_boxes, [tf.shape(scores)[0], -1, tf.shape(class_boxes)[-1]])
+        pred_conf = tf.reshape(pred_conf, [tf.shape(scores)[0], -1, tf.shape(pred_conf)[-1]])
+
+        box_xy, box_wh = tf.split(class_boxes, (2, 2), axis=-1)
+
+        input_shape = tf.cast(input_shape, dtype=tf.float32)
+
+        box_yx = box_xy[..., ::-1]
+        box_hw = box_wh[..., ::-1]
+
+        box_mins = (box_yx - (box_hw / 2.)) / input_shape
+        box_maxes = (box_yx + (box_hw / 2.)) / input_shape
+        boxes = tf.concat([
+            box_mins[..., 0:1],  # y_min
+            box_mins[..., 1:2],  # x_min
+            box_maxes[..., 0:1],  # y_max
+            box_maxes[..., 1:2]  # x_max
+        ], axis=-1)
+        return (boxes, pred_conf)
+
+    def predict_bboxes_nms(self, image_batch, max_outputs_per_class=32, max_outputs=32, iou_threshold=0.45, score_threshold=0.25):
+        image_size = image_batch.shape[1]
+        raw_pred = self(image_batch)
+        pred_bboxes, pred_prob = [],[]
+        for i in range(3):
+            bbox, prob = self._decode(raw_pred, i, image_size)
+            pred_bboxes.append(bbox)
+            pred_prob.append(prob)
+        boxes, conf = self._filter_bboxes(
+            tf.concat(pred_bboxes, axis=-1),
+            tf.concat(pred_prob, axis=-1),
+            score_threshold,
+            image_size
+        )
+        boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
+            boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
+            scores=tf.reshape(
+                conf, (tf.shape(conf)[0], -1, tf.shape(conf)[-1])),
+            max_output_size_per_class=max_outputs_per_class,
+            max_total_size=max_outputs,
+            iou_threshold=iou_threshold,
+            score_threshold=score_threshold
+        )
+
+        return boxes, scores, classes, valid_detections
+
+
+    def draw_bboxes(self, image, clasess=[]):
+        if len(image.shape) == 3:
+            image = np.expand_dims(image, 0)
+
+        boxes, scores, classes, num_boxes = self.predict_bboxes_nms(
+            image
+        )
+
+        if len(classes) == 0:
+            classes = list(self.dataset.classes_dict.values())
+
+        # bbox_data = [x.numpy for x in bbox_data]
+
+        height, width, _ = image.shape
+        hsv_tuples = [(1.0 * x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
+        colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
+        colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), colors))
+
+        boxes, scores, classes, num_boxes
+        for i in range(num_boxes[0]):
+            if int(classes[0][i]) < 0 or int(classes[0][i]) > num_classes: continue
+            coor = boxes[0][i]
+            coor[0] = int(coor[0] * height)
+            coor[2] = int(coor[2] * height)
+            coor[1] = int(coor[1] * width)
+            coor[3] = int(coor[3] * width)
+
+            fontScale = 0.5
+            score = scores[0][i]
+            class_ind = int(classes[0][i])
+            bbox_color = colors[class_ind]
+            bbox_thick = int(0.6 * (height + width) / 600)
+            c1, c2 = (coor[1], coor[0]), (coor[3], coor[2])
+            cv2.rectangle(image, c1, c2, bbox_color, bbox_thick)
+
+            if show_label:
+                bbox_mess = '%s: %.2f' % (classes[class_ind], score)
+                t_size = cv2.getTextSize(bbox_mess, 0, fontScale, thickness=bbox_thick // 2)[0]
+                c3 = (c1[0] + t_size[0], c1[1] - t_size[1] - 3)
+                cv2.rectangle(image, c1, (np.float32(c3[0]), np.float32(c3[1])), bbox_color, -1) #filled
+
+                cv2.putText(image, bbox_mess, (c1[0], np.float32(c1[1] - 2)), cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale, (0, 0, 0), bbox_thick // 2, lineType=cv2.LINE_AA)
+        return image 
 
 class YOLOv4(YOLOModel):
     def __init__(self, num_classes, image_size=416, *args, **kwargs):
         super(YOLOv4, self).__init__(num_classes, image_size, *args, **kwargs)
 
-        self.xyscale = config.config["yolo"]["xyscale"]
-        self.strides = config.config["yolo"]["strides"]
-        self.anchors = config.config["yolo"]["anchors"]
+        self.xyscale = np.array(config.config["yolo"]["xyscale"])
+        self.strides = np.array(config.config["yolo"]["strides"])
+        self.anchors = np.array(config.config["yolo"]["anchors"])
         self.iou_loss_threshold = config.config["yolo"]["IOU_loss_threshold"]
 
 

@@ -46,9 +46,9 @@ class Dataset(object):
         self.num_batches = int(np.ceil(self.num_examples / self.batch_size))
         self.batch_count = 0
 
-        self.train_input_size = image_size
+        self.input_size = image_size
         self.strides = np.array(config["yolo"]["strides"])
-        self.train_output_sizes = self.train_input_size // self.strides
+        self.train_output_sizes = self.input_size // self.strides
 
         self.anchor_per_scale = config["yolo"]["anchor_per_scale"]
         self.anchors = np.array(config["yolo"]["anchors"])
@@ -63,8 +63,8 @@ class Dataset(object):
             batch_image = np.zeros(
                 (
                     self.batch_size,
-                    self.train_input_size,
-                    self.train_input_size,
+                    self.input_size,
+                    self.input_size,
                     3,
                 ),
                 dtype=np.float32,
@@ -188,7 +188,7 @@ class Dataset(object):
         image, bboxes = utils.image_preprocess(
             np.copy(image),
             np.copy(bboxes),
-            self.train_input_size,
+            self.input_size,
         )
         return image, bboxes
 
