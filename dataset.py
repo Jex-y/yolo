@@ -6,10 +6,10 @@ import os
 from . import config
 from . import utils
 
-class Dataset(object):
+class WIDERDataset(object):
     MAX_BBOX_PER_SCALE = 128
 
-    def __init__(self, path, train_or_test, image_size=416, batch_size = 1, augment = False):
+    def __init__(self, path, image_size=416, batch_size = 1, augment = False):
         """Created a dataset to be used to train or test a YOLO model
 
         Args:
@@ -23,25 +23,23 @@ class Dataset(object):
             FileNotFoundError: Raised when dataset file cannot be found. 
         """
         try:
-            with open(path, "r") as f:
-                dataset_dict = yaml.load(f, Loader=yaml.FullLoader)
+            dataset_file = open(path)
         except FileNotFoundError:
             raise FileNotFoundError(f"Dataset file not found at {path}")
-
-        self.working_path = os.path.dirname(os.path.realpath(path))
         
-        self.train_or_test = train_or_test.lower()
-        assert train_or_test in ("train", "test")
+        self.working_path = os.path.realpath(dataset_file.readline().strip())
 
         self.augment_images = augment
 
         self.batch_size = batch_size
         
-        self.num_classes = int(dataset_dict["classes"]["num_classes"])
+        self.num_classes = 1
 
-        self.class_dict = dataset_dict["classes"]["class_names"]
+        self.classes = ["Face"]
 
-        self.examples = dataset_dict["examples"][train_or_test]
+        self.examples = self.split_examples(dataset_file)
+        dataset_file.close()
+
         self.num_examples = len(self.examples)
         self.num_batches = int(np.ceil(self.num_examples / self.batch_size))
         self.batch_count = 0
@@ -158,22 +156,22 @@ class Dataset(object):
         return self.num_batches
 
     def parse_example(self, example):
-        image = cv2.imread(os.path.join(self.working_path, example["image/filename"]))
+        path, num_detections, detections = example
+
+        image = cv2.imread(os.path.join(self.working_path, path))
         if type(image) == type(None):
-            print(image)
-            raise FileNotFoundError(f"Image {example['image/filename']} not found")
+            raise FileNotFoundError(f"Image {path} not found")
 
-        height, width = example["image/height"], example["image/width"]
+        labels = [0 for i in range(num_detections)]
+        
+        bboxes = np.zeros((num_detections,5), dtype=np.int64)
 
-        labels = example["image/object/class/label"]
-
-        bboxes = np.zeros((len(labels),5), dtype=np.int64)
-
-        bboxes[:, 0] = [int(x*width) for x in example["image/object/bbox/xmin"]]
-        bboxes[:, 1] = [int(y*height) for y in example["image/object/bbox/ymin"]]
-        bboxes[:, 2] = [int(x*width) for x in example["image/object/bbox/xmax"]]
-        bboxes[:, 3] = [int(y*height) for y in example["image/object/bbox/ymax"]]
-        bboxes[:, 4] = [int(x) for x in labels]
+        for i in range(num_detections):
+            bbox = [int(x) for x in detections[i].split(" ")[:4]]
+            bbox[2] += bbox[0]
+            bbox[3] += bbox[1]
+            bbox.append(labels[i])
+            bboxes[i] = bbox
 
         if self.augment_images:
             image, bboxes = self.random_horizontal_flip(
@@ -183,14 +181,29 @@ class Dataset(object):
             image, bboxes = self.random_translate(
                 np.copy(image), np.copy(bboxes)
             )
-
+            
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image, bboxes = utils.image_preprocess(
+
+        return utils.image_preprocess(
             np.copy(image),
             np.copy(bboxes),
             self.input_size,
         )
-        return image, bboxes
+
+    def split_examples(self, dataset_file):
+        examples = []
+        while True:
+            path = dataset_file.readline().strip()
+            if not path:
+                break
+            num_detections = int(dataset_file.readline().strip())
+            if num_detections > 0:
+                detections = [dataset_file.readline().strip() for i in range(num_detections)]
+                examples.append((path, num_detections, detections))
+            else:
+                dataset_file.readline()
+        return examples
+
 
     def random_horizontal_flip(self, image, bboxes):
         """Randomly flips images and adjusts bboxes. 

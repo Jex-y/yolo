@@ -23,7 +23,7 @@ class YOLOModel(tf.keras.Model):
         if len(physical_devices) > 0:
             tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-    def fit(self, dataset, epochs=1, first_stage_epochs=None, second_stage_epochs=None, val_dataset=None, start_lr = 1e-3, end_lr = 1e-6, checkpoint_dir = "./checkpoints"):
+    def fit(self, dataset, epochs=1, first_stage_epochs=None, second_stage_epochs=None, val_dataset=None, start_lr = 1e-3, end_lr = 1e-6, checkpoint_dir = "./checkpoints", steps_per_metric_update=1000):
         steps_per_epoch = len(dataset)
 
         total_steps = 0
@@ -72,7 +72,7 @@ class YOLOModel(tf.keras.Model):
 
                 self.optimizer.lr.assign(lr.numpy())
                 
-                done = f"[{i+1:04d}|{steps_per_epoch:04d}]"
+                done = f"[{i+1:05d}|{steps_per_epoch:05d}]"
                 time_per_step = (ns()-start)/(i+1)
                 time_left = self._ns_to_string((steps_per_epoch - i+1) * time_per_step)
                 bar = self._progress_bar((i+1)/steps_per_epoch)
@@ -90,6 +90,19 @@ class YOLOModel(tf.keras.Model):
                     ),end="")
 
                 total_steps += 1   
+
+                if i % steps_per_metric_update == 0:
+                    total_loss = sum(epoch_history["total_loss"])/i
+                    giou_loss = sum(epoch_history["giou_loss"])/i
+                    conf_loss = sum(epoch_history["conf_loss"])/i
+                    prob_loss = sum(epoch_history["prob_loss"])/i
+
+                    with train_summary_writer.as_default():
+                        tf.summary.scalar("loss/total_loss", total_loss, total_steps)
+                        tf.summary.scalar("loss/giou_loss", giou_loss, total_steps)
+                        tf.summary.scalar("loss/conf_loss", conf_loss, total_steps)
+                        tf.summary.scalar("loss/prob_loss", prob_loss, total_steps)
+                        tf.summary.scalar("lr", lr, total_steps)
 
             time_taken = self._ns_to_string(ns()-start)
 
@@ -111,11 +124,11 @@ class YOLOModel(tf.keras.Model):
                 ))
 
             with train_summary_writer.as_default():
-                tf.summary.scalar("loss/total_loss", total_loss, epoch)
-                tf.summary.scalar("loss/giou_loss", giou_loss, epoch)
-                tf.summary.scalar("loss/conf_loss", conf_loss, epoch)
-                tf.summary.scalar("loss/prob_loss", prob_loss, epoch)
-                tf.summary.scalar("lr", lr, epoch)
+                tf.summary.scalar("loss/total_loss", total_loss, total_steps)
+                tf.summary.scalar("loss/giou_loss", giou_loss, total_steps)
+                tf.summary.scalar("loss/conf_loss", conf_loss, total_steps)
+                tf.summary.scalar("loss/prob_loss", prob_loss, total_steps)
+                tf.summary.scalar("lr", lr, total_steps)
             
             if val_dataset:
                 start = ns()
@@ -129,7 +142,7 @@ class YOLOModel(tf.keras.Model):
                     epoch_history["val_conf_loss"].append(conf_loss)
                     epoch_history["val_prob_loss"].append(prob_loss)
 
-                    done = f"[{i+1:04d}|{step_per_val_epoch:04d}]"
+                    done = f"[{i+1:05d}|{step_per_val_epoch:05d}]"
                     time_per_step = (ns()-start)/(i+1)
                     time_left = self._ns_to_string((step_per_val_epoch - i+1) * time_per_step)
                     bar = self._progress_bar((i+1)/step_per_val_epoch)
@@ -144,6 +157,22 @@ class YOLOModel(tf.keras.Model):
                         conf_loss, 
                         prob_loss
                     ),end="")
+
+                    if i % steps_per_metric_update == 0:
+                        total_loss = sum(epoch_history["val_total_loss"])/i
+                        giou_loss = sum(epoch_history["val_giou_loss"])/i
+                        conf_loss = sum(epoch_history["val_conf_loss"])/i
+                        prob_loss = sum(epoch_history["val_prob_loss"])/i
+
+                        example_bboxes = self.draw_bboxes(image[0])
+
+                        with test_summary_writer.as_default():
+                            steps = epoch*step_per_val_epoch + i
+                            tf.summary.scalar("loss/total_loss", total_loss, steps)
+                            tf.summary.scalar("loss/giou_loss", giou_loss, steps)
+                            tf.summary.scalar("loss/conf_loss", conf_loss, steps)
+                            tf.summary.scalar("loss/prob_loss", prob_loss, steps)
+                            tf.summary.image("example_bboxes", example_bboxes, step=steps)
 
                 time_taken = self._ns_to_string(ns()-start)
 
