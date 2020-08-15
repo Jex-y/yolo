@@ -163,6 +163,8 @@ class WIDERDataset(object):
             raise FileNotFoundError(f"Image {path} not found")
 
         labels = [0 for i in range(num_detections)]
+
+        height, width, _ = image.shape
         
         bboxes = np.zeros((num_detections,5), dtype=np.int64)
 
@@ -170,6 +172,11 @@ class WIDERDataset(object):
             bbox = [int(x) for x in detections[i].split(" ")[:4]]
             bbox[2] += bbox[0]
             bbox[3] += bbox[1]
+            for j in range(4):
+                if j%2 == 0:
+                    bbox[j] = bbox[j] if bbox[j] < width else width
+                else:
+                    bbox[j] = bbox[j] if bbox[j] < height else height
             bbox.append(labels[i])
             bboxes[i] = bbox
 
