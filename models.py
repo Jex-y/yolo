@@ -34,11 +34,11 @@ class YOLOModel(tf.keras.Model):
         training_steps = steps_per_epoch * epochs
 
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
+        train_log_dir = 'logs/' + current_time + '/train'
         train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 
         if val_dataset:
-            test_log_dir = 'logs/gradient_tape/' + current_time + '/test'
+            test_log_dir = 'logs/' + current_time + '/test'
             test_summary_writer = tf.summary.create_file_writer(test_log_dir)
 
         if checkpoint_dir:
