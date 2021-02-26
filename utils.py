@@ -23,7 +23,8 @@ def image_preprocess(image, bboxes, train_input_size):
     image_paded = np.full(shape=[target_height, target_width, 3], fill_value=128.0)
     pad_height, pad_width = (target_height-new_height) // 2, (target_width - new_width) // 2
     image_paded[pad_width:new_width+pad_width, pad_height:new_height+pad_height, :] = image_resized
-    image_paded = image_paded / 255.
+    image_paded = image_paded / 256.
+    # 256 used as it is an exact power of 2 so only the exponent is changed, useful for storing in half precision
 
     bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * scale + pad_width
     bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * scale + pad_height

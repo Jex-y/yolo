@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.lib.function_base import median
 import yaml
 import cv2
 import tensorflow as tf
@@ -54,6 +55,79 @@ class WIDERDataset(object):
     def __iter__(self):
         return self
 
+    def _bytes_feature(self, value):
+        if isinstance(value, type(tf.constant(0))):
+            value = value.numpy()
+        return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+    def _floats_feature(self, value):
+        return tf.train.Feature(float_list=tf.train.FloatList(value=value))
+
+    def to_tfrecord(self, filename, shards, use_sparse=False):
+        self.batch_size = 1
+        shard_size = len(self) // shards
+        shard_index = 0
+        examples = []
+
+        print(f"Serialising {shard_size * shards} examples into {shards} shards")
+
+        try:
+            for i, (image, targets) in enumerate(self):
+                if use_sparse:
+                    small_targets = tf.sparse.from_dense(targets[0][0])
+                    medium_targets = tf.sparse.from_dense(targets[1][0])
+                    large_targets = tf.sparse.from_dense(targets[2][0])
+
+                    feature = {
+                        'image'             : self._bytes_feature(tf.io.serialize_tensor(image[0])),
+                        'small_targets'     : self._bytes_feature(tf.io.serialize_sparse(small_targets)[0]),
+                        'medium_targets'    : self._bytes_feature(tf.io.serialize_sparse(medium_targets)[0]),
+                        'large_targets'     : self._bytes_feature(tf.io.serialize_sparse(large_targets)[0]),
+                    }
+                else:
+                    small_targets = targets[0][0]
+                    medium_targets = targets[1][0]
+                    large_targets = targets[2][0]
+
+                    feature = {
+                        'image'             : self._bytes_feature(tf.io.serialize_tensor(image[0])),
+                        'small_targets'     : self._floats_feature(small_targets),
+                        'medium_targets'    : self._floats_feature(medium_targets),
+                        'large_targets'     : self._floats_feature(large_targets),
+                    }
+
+
+                example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
+                examples.append(example_proto.SerializeToString())
+
+                shard_count = (i+1) % shard_size
+                progress = (shard_count / shard_size) * 100
+                print(f"\rShard {shard_index} {progress:.2f}% Complete \r", end="")
+
+                if shard_count == 0:
+
+                    write_path = filename + f".shard{shard_index+1}of{shards}"
+
+                    print(f"\nWriting shard {shard_index} to {write_path}")
+
+                    with tf.io.TFRecordWriter(write_path) as writer:
+                        for example in examples:
+                            writer.write(example)
+
+                    print("Completed writing shard")
+                    
+                    examples = []
+
+                    shard_index += 1
+
+                    if shard_index == shards:
+                        break
+        except StopIteration:
+            pass
+
+        print("All shards created and written")
+
+
     def __next__(self):
         """Return the next batch of the datset until it runs out of data
         """
@@ -65,7 +139,7 @@ class WIDERDataset(object):
                     self.input_size,
                     3,
                 ),
-                dtype=np.float32,
+                dtype=np.float16,
             )
 
             batch_label_sbbox = np.zeros(
@@ -76,7 +150,7 @@ class WIDERDataset(object):
                     self.anchor_per_scale,
                     5 + self.num_classes,
                 ),
-                dtype=np.float32,
+                dtype=np.float16,
             )
             batch_label_mbbox = np.zeros(
                 (
@@ -86,7 +160,7 @@ class WIDERDataset(object):
                     self.anchor_per_scale,
                     5 + self.num_classes,
                 ),
-                dtype=np.float32,
+                dtype=np.float16,
             )
             batch_label_lbbox = np.zeros(
                 (
@@ -96,17 +170,17 @@ class WIDERDataset(object):
                     self.anchor_per_scale,
                     5 + self.num_classes,
                 ),
-                dtype=np.float32,
+                dtype=np.float16,
             )
 
             batch_sbboxes = np.zeros(
-                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float16
             )
             batch_mbboxes = np.zeros(
-                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float16
             )
             batch_lbboxes = np.zeros(
-                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float32
+                (self.batch_size, self.MAX_BBOX_PER_SCALE, 4), dtype=np.float16
             )
 
 
@@ -135,16 +209,15 @@ class WIDERDataset(object):
                     batch_lbboxes[num, :, :] = lbboxes
                     num += 1
                 self.batch_count += 1
-                batch_smaller_target = batch_label_sbbox, batch_sbboxes
-                batch_medium_target = batch_label_mbbox, batch_mbboxes
-                batch_larger_target = batch_label_lbbox, batch_lbboxes
-
+                batch_smaller_target = [ np.reshape(batch_label_sbbox, (self.batch_size, -1)), np.reshape(batch_sbboxes, (self.batch_size, -1)) ]
+                batch_medium_target = [ np.reshape(batch_label_mbbox, (self.batch_size, -1)), np.reshape(batch_mbboxes, (self.batch_size, -1)) ]
+                batch_larger_target = [ np.reshape(batch_label_lbbox, (self.batch_size, -1)) , np.reshape(batch_lbboxes, (self.batch_size, -1)) ]
                 return (
                     batch_image,
                     (
-                        batch_smaller_target,
-                        batch_medium_target,
-                        batch_larger_target,
+                        np.concatenate(batch_smaller_target, -1),
+                        np.concatenate(batch_medium_target, -1),
+                        np.concatenate(batch_larger_target, -1),
                     ),
                 )
             else:
@@ -174,9 +247,9 @@ class WIDERDataset(object):
             bbox[3] += bbox[1]
             for j in range(4):
                 if j%2 == 0:
-                    bbox[j] = bbox[j] if bbox[j] < width else width
+                    bbox[j] = bbox[j] if bbox[j] < width else width - 1
                 else:
-                    bbox[j] = bbox[j] if bbox[j] < height else height
+                    bbox[j] = bbox[j] if bbox[j] < height else height - 1
             bbox.append(labels[i])
             bboxes[i] = bbox
 
