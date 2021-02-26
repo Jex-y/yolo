@@ -1,6 +1,4 @@
 import numpy as np
-from numpy.lib.function_base import median
-import yaml
 import cv2
 import tensorflow as tf
 import os

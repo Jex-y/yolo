@@ -6,7 +6,7 @@ import numpy as np
 # num_classes = self.num_classes
 # iou_loss_threshold = self.iou_loss_threshold
 
-@tf.function
+# @tf.function
 def yolo_loss(pred, conv, label, bboxes, input_size, iou_loss_threshold):
     conv_raw_conf = conv[:, :, :, :, 4:5]
     conv_raw_prob = conv[:, :, :, :, 5:]
@@ -45,7 +45,7 @@ def yolo_loss(pred, conv, label, bboxes, input_size, iou_loss_threshold):
 
     return giou_loss, conf_loss, prob_loss
 
-@tf.function
+# @tf.function
 def decode_train(conv_output, scale, output_size, num_classes, strides, xyscale, anchors):
     conv_raw_dxdy, conv_raw_dwdh, conv_raw_conf, conv_raw_prob = tf.split(conv_output, (2, 2, 1, num_classes),
                                                                         axis=-1)
@@ -69,14 +69,14 @@ def decode_train(conv_output, scale, output_size, num_classes, strides, xyscale,
 def get_yolo_loss_at_scales(scales, num_classes, strides, iou_loss_threshold, xyscale, anchors):
     losses = []
     for scale in scales[::-1]:
-        @tf.function
+        # @tf.function
         def loss(target, output):
             output_shape = tf.shape(output)
             batch_size = output_shape[0]
             output_size = output_shape[1]
             input_size = output_size * strides[scale]
             output_shape = (batch_size, output_size, output_size, 3, 5+num_classes)
-            target_split = np.prod(output_shape)
+            target_split = np.prod(output_shape[1:])
 
             output = tf.reshape(output, output_shape)
             labels = tf.reshape(target[:,:target_split], output_shape)
