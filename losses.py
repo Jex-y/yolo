@@ -45,31 +45,10 @@ def yolo_loss(pred, conv, label, bboxes, input_size, iou_loss_threshold):
 
     return giou_loss, conf_loss, prob_loss
 
-# @tf.function
-def decode_train(conv_output, scale, output_size, num_classes, strides, xyscale, anchors):
-    conv_raw_dxdy, conv_raw_dwdh, conv_raw_conf, conv_raw_prob = tf.split(conv_output, (2, 2, 1, num_classes),
-                                                                        axis=-1)
-
-    xy_grid = tf.meshgrid(tf.range(output_size), tf.range(output_size))
-    xy_grid = tf.expand_dims(tf.stack(xy_grid, axis=-1), axis=2)  # [gx, gy, 1, 2]
-    xy_grid = tf.tile(tf.expand_dims(xy_grid, axis=0), [tf.shape(conv_output)[0], 1, 1, 3, 1])
-
-    xy_grid = tf.cast(xy_grid, tf.float32)
-
-    pred_xy = ((tf.sigmoid(conv_raw_dxdy) * xyscale[scale]) - 0.5 * (xyscale[scale] - 1) + xy_grid) * \
-            strides[scale]
-    pred_wh = (tf.exp(conv_raw_dwdh) * anchors[scale])
-    pred_xywh = tf.concat([pred_xy, pred_wh], axis=-1)
-
-    pred_conf = tf.sigmoid(conv_raw_conf)
-    pred_prob = tf.sigmoid(conv_raw_prob)
-
-    return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
-
 def get_yolo_loss_at_scales(scales, num_classes, strides, iou_loss_threshold, xyscale, anchors):
     losses = []
     for scale in scales[::-1]:
-        # @tf.function
+        @tf.function
         def loss(target, output):
             output_shape = tf.shape(output)
             batch_size = output_shape[0]
@@ -82,7 +61,7 @@ def get_yolo_loss_at_scales(scales, num_classes, strides, iou_loss_threshold, xy
             labels = tf.reshape(target[:,:target_split], output_shape)
             bboxes = tf.reshape(target[:,target_split:], (batch_size, 128, 4))
 
-            decoded = decode_train(output, scale, output_size, num_classes, strides, xyscale, anchors)
+            decoded = utils.decode_train(output, scale, output_size, num_classes, strides, xyscale, anchors)
             giou_loss, conf_loss, prob_loss = yolo_loss(decoded, output, labels, bboxes, input_size, iou_loss_threshold)
             return giou_loss + conf_loss + prob_loss
         
